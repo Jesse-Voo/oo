@@ -146,13 +146,6 @@ def lees_laatste_detectie():
         with open(DETECTION_FILE, 'r') as f:
             data = json.load(f)
         
-        # Controleer of detectie niet te oud is (max 30 seconden)
-        if 'unix_timestamp' in data:
-            age = time.time() - data['unix_timestamp']
-            if age > 30:
-                print("⚠️  Detectie te oud (>30s)")
-                return None
-        
         return {
             'rfid_id': data.get('rfid_id'),
             'name': data.get('name', data.get('rfid_id'))
