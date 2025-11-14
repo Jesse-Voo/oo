@@ -255,11 +255,11 @@ def setup_knop():
                              bouncetime=300)  # 300ms debounce
         
         print(f"✅ Knop geconfigureerd op GPIO {KNOP_PIN}")
+        print("   Druk op de knop om te starten of een sector te registreren")
     except Exception as e:
         print(f"❌ Fout bij configureren knop: {e}")
         print("   Probeer: sudo python3 timing_service.py")
         raise
-    print("   Druk op de knop om te starten of een sector te registreren")
 
 def status_reporter_loop():
     """Achtergrond thread die periodiek status rapporteert"""
