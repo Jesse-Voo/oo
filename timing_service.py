@@ -239,15 +239,26 @@ def setup_knop():
         print("🔧 GPIO simulatie modus - geen echte knop")
         return
     
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(KNOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    
-    # Interrupt op dalende flank (knop indrukken)
-    GPIO.add_event_detect(KNOP_PIN, GPIO.FALLING, 
-                         callback=knop_ingedrukt, 
-                         bouncetime=300)  # 300ms debounce
-    
-    print(f"✅ Knop geconfigureerd op GPIO {KNOP_PIN}")
+    try:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(KNOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        
+        # Verwijder eerst oude event detection als die bestaat
+        try:
+            GPIO.remove_event_detect(KNOP_PIN)
+        except:
+            pass  # Geen event detection om te verwijderen
+        
+        # Interrupt op dalende flank (knop indrukken)
+        GPIO.add_event_detect(KNOP_PIN, GPIO.FALLING, 
+                             callback=knop_ingedrukt, 
+                             bouncetime=300)  # 300ms debounce
+        
+        print(f"✅ Knop geconfigureerd op GPIO {KNOP_PIN}")
+    except Exception as e:
+        print(f"❌ Fout bij configureren knop: {e}")
+        print("   Probeer: sudo python3 timing_service.py")
+        raise
     print("   Druk op de knop om te starten of een sector te registreren")
 
 def status_reporter_loop():
