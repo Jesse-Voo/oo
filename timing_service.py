@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Timing Service - Knop gebaseerd timing systeem
-Leest rijder uit latest_detection.json en gebruikt knop voor sectoren
+Timing Service - RFID voor rijder identificatie, knop voor sectoren
+Scan RFID → Start sessie, Druk op knop → Registreer sector
 """
 
 import time
@@ -14,11 +14,12 @@ from collections import defaultdict
 
 try:
     import RPi.GPIO as GPIO
+    from mfrc522 import MFRC522
     GPIO.setwarnings(False)
-    GPIO_AVAILABLE = True
+    RFID_AVAILABLE = True
 except ImportError:
-    GPIO_AVAILABLE = False
-    print("GPIO niet beschikbaar - simulatie modus")
+    RFID_AVAILABLE = False
+    print("RFID libraries niet beschikbaar - dummy mode")
 
 # Import stoplicht controller
 try:
@@ -30,16 +31,17 @@ except ImportError:
 
 # Configuratie
 SECTOR_AANTAL = 3
-DETECTION_FILE = "latest_detection.json"
+TAGS_BESTAND = "tags.csv"
 LEADERBOARD_BESTAND = "voorbeeld_leaderboard.csv"
 TOTALE_AFSTAND_KM = 7.2
-KNOP_PIN = 4  # GPIO pin voor de sector knop (pas aan naar jouw setup)
+KNOP_PIN = 26  # GPIO pin voor de sector knop
 DEBOUNCE_TIJD = 1.0  # Seconden tussen knop presses
 STATUS_FILE = "timing_status.json"
 
-# Actieve sessies: {rfid_id: SessionData}
+# Actieve sessies: {uid: SessionData}
 actieve_sessies = {}
 sessie_lock = threading.Lock()
+laatste_rfid_scan = {"uid": None, "tijd": 0}
 
 # Initialiseer stoplicht controller
 stoplicht = None
@@ -49,8 +51,8 @@ if STOPLICHT_AVAILABLE:
 
 class SessionData:
     """Data voor een actieve timing sessie"""
-    def __init__(self, rfid_id, naam):
-        self.rfid_id = rfid_id
+    def __init__(self, uid, naam):
+        self.uid = uid
         self.naam = naam
         self.start_tijd = time.time()
         self.sector_tijden = []
@@ -137,22 +139,19 @@ def format_tijd(seconden):
     sec = seconden % 60
     return f"{minuten}:{sec:.1f}"
 
-def lees_laatste_detectie():
-    """Lees de laatste RFID detectie uit JSON bestand"""
-    if not os.path.exists(DETECTION_FILE):
-        return None
+def zoek_naam(uid_str):
+    """Zoek naam bij UID in tags bestand"""
+    if not os.path.isfile(TAGS_BESTAND):
+        return uid_str
     
-    try:
-        with open(DETECTION_FILE, 'r') as f:
-            data = json.load(f)
-        
-        return {
-            'rfid_id': data.get('rfid_id'),
-            'name': data.get('name', data.get('rfid_id'))
-        }
-    except Exception as e:
-        print(f"❌ Fout bij lezen detectie: {e}")
-        return None
+    with open(TAGS_BESTAND, newline='', encoding='utf-8') as file:
+        reader = csv.reader(file)
+        next(reader, None)  # Skip header
+        for row in reader:
+            if row and row[0] == uid_str:
+                return row[1]
+    
+    return uid_str
 
 def schrijf_status():
     """Schrijf huidige status naar JSON bestand voor Flask"""
@@ -162,10 +161,10 @@ def schrijf_status():
             "actieve_sessies": []
         }
         
-        for rfid_id, sessie in actieve_sessies.items():
+        for uid, sessie in actieve_sessies.items():
             verstreken = time.time() - sessie.start_tijd
             status_data["actieve_sessies"].append({
-                "rfid_id": rfid_id,
+                "uid": uid,
                 "naam": sessie.naam,
                 "huidige_sector": sessie.huidige_sector(),
                 "totaal_sectoren": SECTOR_AANTAL,
@@ -186,33 +185,41 @@ def knop_ingedrukt(channel):
     
     with sessie_lock:
         if len(actieve_sessies) == 0:
-            # Geen actieve sessie - start nieuwe sessie
-            detectie = lees_laatste_detectie()
-            
-            if not detectie:
-                print("❌ Geen recente RFID detectie gevonden")
+            # Geen actieve sessie - check of er recent een RFID scan was
+            if laatste_rfid_scan["uid"] is None:
+                print("❌ Geen RFID scan gevonden")
                 print("   Scan eerst je RFID tag voordat je de knop indrukt!")
                 return
             
-            rfid_id = detectie['rfid_id']
-            naam = detectie['name']
+            # Check of scan niet te oud is (max 10 seconden)
+            scan_age = time.time() - laatste_rfid_scan["tijd"]
+            if scan_age > 10:
+                print(f"⚠️  RFID scan te oud ({scan_age:.1f}s geleden)")
+                print("   Scan opnieuw je RFID tag!")
+                return
+            
+            uid = laatste_rfid_scan["uid"]
+            naam = zoek_naam(uid)
             
             # Start nieuwe sessie
-            sessie = SessionData(rfid_id, naam)
-            actieve_sessies[rfid_id] = sessie
+            sessie = SessionData(uid, naam)
+            actieve_sessies[uid] = sessie
             
             print(f"🚀 Nieuwe sessie gestart voor {naam}")
             print(f"   Druk op de knop bij elke sector ({SECTOR_AANTAL} totaal)")
             
+            # Reset laatste scan
+            laatste_rfid_scan["uid"] = None
+            
         else:
             # Er is al een actieve sessie - registreer sector
-            # Neem de eerst actieve sessie (normaal is er maar 1)
-            rfid_id = list(actieve_sessies.keys())[0]
-            sessie = actieve_sessies[rfid_id]
+            # Neem de eerste actieve sessie (normaal is er maar 1)
+            uid = list(actieve_sessies.keys())[0]
+            sessie = actieve_sessies[uid]
             
             if sessie.voltooid:
                 print(f"⚠️  Sessie voor {sessie.naam} is al voltooid")
-                del actieve_sessies[rfid_id]
+                del actieve_sessies[uid]
                 return
             
             print(f"📍 {sessie.naam} - Sector {sessie.huidige_sector()} geregistreerd")
@@ -220,39 +227,76 @@ def knop_ingedrukt(channel):
             if sessie.voeg_sector_toe():
                 if sessie.voltooid:
                     # Sessie is klaar, verwijder uit actieve sessies
-                    del actieve_sessies[rfid_id]
+                    del actieve_sessies[uid]
                     print(f"🏁 Sessie beëindigd voor {sessie.naam}")
     
     # Update status file
     schrijf_status()
 
+def rfid_scanner_loop():
+    """Hoofdloop die continu naar RFID scans luistert (alleen voor naam)"""
+    if not RFID_AVAILABLE:
+        print("⚠️  RFID niet beschikbaar - dummy mode actief")
+        return
+    
+    reader = MFRC522()
+    laatste_uid = None
+    laatste_scan_tijd = 0
+    
+    print("🎯 RFID scanner actief - scan je tag om een sessie voor te bereiden...\n")
+    
+    while True:
+        try:
+            (status, TagType) = reader.MFRC522_Request(reader.PICC_REQIDL)
+            if status == reader.MI_OK:
+                (status, uid) = reader.MFRC522_Anticoll()
+                if status == reader.MI_OK:
+                    uid_str = "-".join(str(x) for x in uid)
+                    nu = time.time()
+                    
+                    # Debounce - voorkom dubbele scans
+                    if uid_str != laatste_uid or (nu - laatste_scan_tijd) > 2.0:
+                        naam = zoek_naam(uid_str)
+                        
+                        with sessie_lock:
+                            # Check of deze rijder al een actieve sessie heeft
+                            if uid_str in actieve_sessies:
+                                print(f"ℹ️  {naam} heeft al een actieve sessie")
+                            else:
+                                # Sla scan op voor wanneer knop wordt ingedrukt
+                                laatste_rfid_scan["uid"] = uid_str
+                                laatste_rfid_scan["tijd"] = nu
+                                print(f"✅ RFID scan: {naam}")
+                                print(f"   Druk op de knop om de sessie te starten!")
+                        
+                        laatste_uid = uid_str
+                        laatste_scan_tijd = nu
+            
+            time.sleep(0.3)
+            
+        except KeyboardInterrupt:
+            print("\n\n🛑 Service gestopt")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            time.sleep(1)
+
 def setup_knop():
     """Initialiseer GPIO knop"""
-    if not GPIO_AVAILABLE:
+    if not RFID_AVAILABLE:
         print("🔧 GPIO simulatie modus - geen echte knop")
         return
     
-    try:
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(KNOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        
-        # Verwijder eerst oude event detection als die bestaat
-        try:
-            GPIO.remove_event_detect(KNOP_PIN)
-        except:
-            pass  # Geen event detection om te verwijderen
-        
-        # Interrupt op dalende flank (knop indrukken)
-        GPIO.add_event_detect(KNOP_PIN, GPIO.FALLING, 
-                             callback=knop_ingedrukt, 
-                             bouncetime=300)  # 300ms debounce
-        
-        print(f"✅ Knop geconfigureerd op GPIO {KNOP_PIN}")
-        print("   Druk op de knop om te starten of een sector te registreren")
-    except Exception as e:
-        print(f"❌ Fout bij configureren knop: {e}")
-        print("   Probeer: sudo python3 timing_service.py")
-        raise
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(KNOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    
+    # Interrupt op dalende flank (knop indrukken)
+    GPIO.add_event_detect(KNOP_PIN, GPIO.FALLING, 
+                         callback=knop_ingedrukt, 
+                         bouncetime=300)  # 300ms debounce
+    
+    print(f"✅ Knop geconfigureerd op GPIO {KNOP_PIN}")
+    print("   Druk op de knop om te starten of een sector te registreren\n")
 
 def status_reporter_loop():
     """Achtergrond thread die periodiek status rapporteert"""
@@ -262,7 +306,7 @@ def status_reporter_loop():
         with sessie_lock:
             if actieve_sessies:
                 print(f"\n📊 Status: {len(actieve_sessies)} actieve sessie(s)")
-                for rfid_id, sessie in actieve_sessies.items():
+                for uid, sessie in actieve_sessies.items():
                     verstreken = time.time() - sessie.start_tijd
                     print(f"   • {sessie.naam}: Sector {sessie.huidige_sector()}/{SECTOR_AANTAL} ({format_tijd(verstreken)})")
                 print()
@@ -270,27 +314,15 @@ def status_reporter_loop():
         # Update status file
         schrijf_status()
 
-def simulatie_loop():
-    """Simulatie modus voor testen zonder GPIO"""
-    print("\n⌨️  SIMULATIE MODUS")
-    print("Druk op ENTER om een knop druk te simuleren")
-    print("Type 'quit' om te stoppen\n")
-    
-    while True:
-        cmd = input()
-        if cmd.lower() == 'quit':
-            break
-        knop_ingedrukt(None)
-
 def main():
     """Start de timing service"""
     print("=" * 60)
-    print("🏁 Dirty Hill Timing Service (Knop Mode)")
+    print("🏁 Dirty Hill Timing Service")
     print("=" * 60)
     print(f"Sectoren: {SECTOR_AANTAL}")
     print(f"Afstand: {TOTALE_AFSTAND_KM} km")
-    print(f"Detectie bestand: {DETECTION_FILE}")
     print(f"Knop pin: GPIO {KNOP_PIN}")
+    print(f"Mode: RFID voor naam, Knop voor sectoren")
     print("=" * 60 + "\n")
     
     # Start status reporter thread
@@ -300,19 +332,11 @@ def main():
     # Setup knop
     setup_knop()
     
+    # Start RFID scanner (hoofdloop)
     try:
-        if GPIO_AVAILABLE:
-            print("🎯 Service actief - wachten op knop presses...\n")
-            # Blijf draaien
-            while True:
-                time.sleep(1)
-        else:
-            # Simulatie modus
-            simulatie_loop()
-    except KeyboardInterrupt:
-        print("\n\n🛑 Service gestopt")
+        rfid_scanner_loop()
     finally:
-        if GPIO_AVAILABLE:
+        if RFID_AVAILABLE:
             GPIO.cleanup()
         if stoplicht:
             stoplicht.cleanup()
