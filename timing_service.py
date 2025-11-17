@@ -1,157 +1,219 @@
-#!/usr/bin/env python3
-
+import RPi.GPIO as GPIO
 import time
-import json
 import csv
 import os
 import threading
-from datetime import datetime
 
-import RPi.GPIO as GPIO
-
-# Configuratie
 SECTOR_AANTAL = 3
 LEADERBOARD_BESTAND = "voorbeeld_leaderboard.csv"
-STATUS_FILE = "timing_status.json"
-BUTTON_PIN = 26     # Fysieke knop op GPIO17
-DEBOUNCE_TIJD = 0.5
 
-actieve_sessie = None
-sessie_lock = threading.Lock()
+# Pins ------------------------------------------
+BUTTON_PIN = 17       # start/sector knop
+GREEN = 5
+YELLOW = 6
+RED = 13
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+GPIO.setup(GREEN, GPIO.OUT)
+GPIO.setup(YELLOW, GPIO.OUT)
+GPIO.setup(RED, GPIO.OUT)
 
 
-class SessionData:
-    def __init__(self, naam):
-        self.naam = naam
-        self.start_tijd = time.time()
-        self.sector_tijden = []
-        self.laatste_scan = time.time()
-        self.voltooid = False
+def leds_off():
+    GPIO.output(GREEN, 0)
+    GPIO.output(YELLOW, 0)
+    GPIO.output(RED, 0)
 
-    def huidige_sector(self):
-        return len(self.sector_tijden) + 1
 
-    def is_klaar(self):
-        return len(self.sector_tijden) >= SECTOR_AANTAL
+leds_off()
 
-    def voeg_sector_toe(self):
-        nu = time.time()
+# ------------------------------------------------
+# TIJD PARSING & CSV FUNCTIES
+# ------------------------------------------------
 
-        if nu - self.laatste_scan < DEBOUNCE_TIJD:
-            return False
 
-        if len(self.sector_tijden) == 0:
-            sector_tijd = nu - self.start_tijd
-        else:
-            sector_tijd = nu - self.laatste_scan
-
-        self.sector_tijden.append(sector_tijd)
-        self.laatste_scan = nu
-
-        print(f"Sector {len(self.sector_tijden)}: {format_tijd(sector_tijd)}")
-
-        if self.is_klaar():
-            self.voltooid = True
-            self.sla_resultaat_op()
-
-        return True
-
-    def sla_resultaat_op(self):
-        totale_tijd_sec = sum(self.sector_tijden)
-        totale_tijd_str = format_tijd(totale_tijd_sec)
-
-        sector_tijden_str = [format_tijd(t) for t in self.sector_tijden]
-
-        file_exists = os.path.isfile(LEADERBOARD_BESTAND)
-        with open(LEADERBOARD_BESTAND, mode='a', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            if not file_exists:
-                writer.writerow(["Naam", "Totaaltijd", "Sector 1", "Sector 2", "Sector 3"])
-
-            row = [self.naam, totale_tijd_str]
-            for i in range(SECTOR_AANTAL):
-                row.append(sector_tijden_str[i] if i < len(sector_tijden_str) else "")
-            writer.writerow(row)
-
-        print("\nKlaar!")
-        print(f"Totale tijd: {totale_tijd_str}")
-
-        print("Resultaat opgeslagen.\n")
+def parse_tijd(t):
+    m, s = t.split(":")
+    return int(m) * 60 + float(s)
 
 
 def format_tijd(sec):
-    minuten = int(sec // 60)
-    return f"{minuten}:{sec % 60:.1f}"
+    m = int(sec // 60)
+    s = sec % 60
+    return f"{m}:{s:04.1f}"
 
 
-def schrijf_status():
-    with sessie_lock:
-        if not actieve_sessie:
+def haal_vorige_rit(naam):
+    if not os.path.isfile(LEADERBOARD_BESTAND):
+        return None
+
+    laatste = None
+    with open(LEADERBOARD_BESTAND, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+
+        for row in reader:
+            if len(row) < 5:
+                continue
+            if row[0] == naam:
+                laatste = row
+
+    if laatste is None:
+        return None
+
+    totale_tijd = parse_tijd(laatste[1])
+    sector_tijden = []
+
+    for s in laatste[2:2 + SECTOR_AANTAL]:
+        if s.strip():
+            sector_tijden.append(parse_tijd(s))
+
+    return {
+        "totale_tijd": totale_tijd,
+        "sector_tijden": sector_tijden
+    }
+
+
+# ------------------------------------------------
+# STOPLICHT
+# ------------------------------------------------
+
+
+def show_sector_light(naam, sector_index, nieuwe_tijd):
+    vorige = haal_vorige_rit(naam)
+
+    if vorige is None or sector_index >= len(vorige["sector_tijden"]):
+        GPIO.output(GREEN, 1)
+        GPIO.output(YELLOW, 1)
+        GPIO.output(RED, 1)
+        return
+
+    oud = vorige["sector_tijden"][sector_index]
+    diff = nieuwe_tijd - oud
+
+    if diff < -10:
+        GPIO.output(GREEN, 1)
+        GPIO.output(YELLOW, 0)
+        GPIO.output(RED, 0)
+    elif diff > 10:
+        GPIO.output(GREEN, 0)
+        GPIO.output(YELLOW, 0)
+        GPIO.output(RED, 1)
+    else:
+        GPIO.output(GREEN, 0)
+        GPIO.output(YELLOW, 1)
+        GPIO.output(RED, 0)
+
+
+def party_animation():
+    for i in range(18):
+        GPIO.output(GREEN, i % 3 == 0)
+        GPIO.output(YELLOW, i % 3 == 1)
+        GPIO.output(RED, i % 3 == 2)
+        time.sleep(0.12)
+
+    leds_off()
+
+
+# ------------------------------------------------
+# TIMING CLASS
+# ------------------------------------------------
+
+
+class TimingService:
+    def __init__(self, naam):
+        self.naam = naam
+        self.reset()
+
+    def reset(self):
+        self.start_tijd = None
+        self.sector_tijden = []
+        self.vorige_checkpoint = None
+        leds_off()
+
+    def start(self):
+        self.start_tijd = time.time()
+        self.vorige_checkpoint = self.start_tijd
+        self.sector_tijden = []
+        print("GESTART")
+
+    def voeg_sector_toe(self):
+        if self.start_tijd is None:
+            self.start()
             return
 
-        data = {
-            "timestamp": time.time(),
-            "actieve_sessie": {
-                "naam": actieve_sessie.naam,
-                "huidige_sector": actieve_sessie.huidige_sector(),
-                "totaal_sectoren": SECTOR_AANTAL,
-                "verstreken_tijd": time.time() - actieve_sessie.start_tijd,
-                "sector_tijden": actieve_sessie.sector_tijden,
-                "start_tijd": actieve_sessie.start_tijd
-            }
-        }
+        nu = time.time()
+        sector_tijd = nu - self.vorige_checkpoint
+        self.vorige_checkpoint = nu
 
-        with open(STATUS_FILE, "w") as f:
-            json.dump(data, f)
+        self.sector_tijden.append(sector_tijd)
+
+        sector_index = len(self.sector_tijden) - 1
+        show_sector_light(self.naam, sector_index, sector_tijd)
+
+        print(f"Sector {sector_index + 1}: {format_tijd(sector_tijd)}")
+
+        if len(self.sector_tijden) == SECTOR_AANTAL:
+            self.eindig()
+
+    def eindig(self):
+        totale_tijd_sec = sum(self.sector_tijden)
+
+        print("Totale tijd:", format_tijd(totale_tijd_sec))
+
+        vorig = haal_vorige_rit(self.naam)
+        if vorig and totale_tijd_sec < vorig["totale_tijd"]:
+            print("SNELLER DAN VORIGE KEER → PARTY")
+            party_animation()
+
+        self.sla_resultaat_op(totale_tijd_sec)
+        self.reset()
+
+    def sla_resultaat_op(self, totale_tijd):
+        nieuw = [
+            self.naam,
+            format_tijd(totale_tijd),
+            *[format_tijd(t) for t in self.sector_tijden]
+        ]
+
+        bestaan = os.path.isfile(LEADERBOARD_BESTAND)
+        with open(LEADERBOARD_BESTAND, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if not bestaan:
+                header = ["Naam", "TotaleTijd"] + \
+                         [f"Sector{i+1}" for i in range(SECTOR_AANTAL)]
+                w.writerow(header)
+            w.writerow(nieuw)
+
+        print("Opgeslagen:", nieuw)
 
 
-def status_loop():
+# ------------------------------------------------
+# BUTTON LOOP
+# ------------------------------------------------
+
+
+def wacht_op_klik(callback):
+    last = time.time()
     while True:
-        time.sleep(1)
-        schrijf_status()
+        if GPIO.input(BUTTON_PIN) == 0:
+            if time.time() - last > 0.4:
+                callback()
+                last = time.time()
+        time.sleep(0.02)
 
 
-def button_callback(channel):
-    global actieve_sessie
-
-    with sessie_lock:
-        if not actieve_sessie:
-            print("Geen actieve sessie.")
-            return
-
-        if actieve_sessie.voltooid:
-            print("Sessie al voltooid.")
-            return
-
-        if actieve_sessie.voeg_sector_toe():
-            if actieve_sessie.voltooid:
-                print("Sessie is voltooid.")
-                actieve_sessie = None
-
-
-def main():
-    global actieve_sessie
-
-    naam = input("Voer naam in: ")
-
-    actieve_sessie = SessionData(naam)
-    print(f"Sessie gestart voor {naam}")
-    print(f"Druk op de knop voor sector registraties ({SECTOR_AANTAL} totaal).")
-
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-    GPIO.add_event_detect(BUTTON_PIN, GPIO.FALLING, callback=button_callback, bouncetime=200)
-
-    t = threading.Thread(target=status_loop, daemon=True)
-    t.start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        GPIO.cleanup()
-
+# ------------------------------------------------
+# MAIN
+# ------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    naam = input("Naam rijder: ").strip()
+    service = TimingService(naam)
+
+    try:
+        wacht_op_klik(service.voeg_sector_toe)
+    finally:
+        GPIO.cleanup()
