@@ -102,9 +102,12 @@ class SessionData:
         totale_tijd_sec = sum(self.sector_tijden)
         totale_tijd_str = format_tijd(totale_tijd_sec)
         
-        # Bereken gemiddelde snelheid
-        totale_tijd_uur = totale_tijd_sec / 3600
-        gem_snelheid = TOTALE_AFSTAND_KM / totale_tijd_uur
+        # Bereken gemiddelde snelheid (veilig voor deling door 0)
+        if totale_tijd_sec > 0:
+            totale_tijd_uur = totale_tijd_sec / 3600
+            gem_snelheid = TOTALE_AFSTAND_KM / totale_tijd_uur
+        else:
+            gem_snelheid = 0.0
         
         # Format sector tijden
         sector_tijden_str = [format_tijd(t) for t in self.sector_tijden]
@@ -135,9 +138,16 @@ class SessionData:
 
 def format_tijd(seconden):
     """Format seconden naar mm:ss.s"""
-    minuten = int(seconden // 60)
-    sec = seconden % 60
-    return f"{minuten}:{sec:.1f}"
+    # Check voor NaN of None
+    if seconden is None or (isinstance(seconden, float) and (seconden != seconden or seconden == float('inf'))):
+        return "0:0.0"
+    
+    try:
+        minuten = int(seconden // 60)
+        sec = seconden % 60
+        return f"{minuten}:{sec:.1f}"
+    except (ValueError, TypeError, ZeroDivisionError):
+        return "0:0.0"
 
 def zoek_naam(uid_str):
     """Zoek naam bij UID in tags bestand"""
